@@ -1,0 +1,9 @@
+[project]
+name = "store-operator"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.12"
+dependencies = [
+    "kopf>=1.44.6",
+    "kubernetes>=36.0.3",
+]

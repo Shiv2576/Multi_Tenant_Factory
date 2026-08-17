@@ -95,4 +95,7 @@ PVC-resize-then-StatefulSet-recreate sequence above as an explicit,
 carefully-tested operator handler — treated as a genuinely higher-risk
 operation than any other reconciliation path in this project, given it
 touches live database storage.
+
 # Multi_Tenant_Factory
+
+// another issue cert manager acme test resource quota conflict.

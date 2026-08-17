@@ -1,0 +1,58 @@
+# store-crd.yaml
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: stores.factory.example.com
+spec:
+  group: factory.example.com
+  scope: Namespaced
+  names:
+    kind: Store
+    plural: stores
+    singular: store
+    shortNames: ["st"]
+  versions:
+    - name: v1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              required: ["tenantId", "storeId", "domain", "plan"]
+              properties:
+                tenantId:
+                  type: string
+                storeId:
+                  type: string
+                domain:
+                  type: string
+                plan:
+                  type: string
+                  enum: ["basic", "pro"]
+            status:
+              type: object
+              properties:
+                phase:
+                  type: string
+                  enum: ["Pending", "Provisioning", "Ready", "Failed"]
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: Tenant
+          type: string
+          jsonPath: .spec.tenantId
+        - name: Store
+          type: string
+          jsonPath: .spec.storeId
+        - name: Plan
+          type: string
+          jsonPath: .spec.plan
+        - name: Domain
+          type: string
+          jsonPath: .spec.domain
+        - name: Phase
+          type: string
+          jsonPath: .status.phase

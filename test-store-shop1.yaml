@@ -1,0 +1,11 @@
+# test-store.yaml
+apiVersion: factory.example.com/v1
+kind: Store
+metadata:
+  name: store-tenant001-shop1
+  namespace: factory-system
+spec:
+  tenantId: tenant001
+  storeId: shop1
+  domain: shop1.tenant001.local
+  plan: basic
