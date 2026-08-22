@@ -1,0 +1,12 @@
+[project]
+name = "control-plane-api"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.141.1",
+    "kubernetes>=36.0.3",
+    "pydantic>=2.13.4",
+    "pyjwt>=2.13.0",
+    "uvicorn[standard]>=0.52.3",
+]

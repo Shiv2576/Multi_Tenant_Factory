@@ -1,5 +1,6 @@
 # operator.py
 import secrets as pysecrets
+import time
 
 import kopf
 import kubernetes.client as k8s
@@ -8,14 +9,6 @@ GROUP = "factory.example.com"
 VERSION = "v1"
 REGISTRY_NS = "factory-system"
 
-ADMIN_PASSWORD = (
-    "changeme123"  # fine for local/demo; move to a generated Secret before real use
-)
-
-# Per-STORE plan sizing (plan now lives on Store, not Tenant).
-# requests/limits are what each store's containers actually ask for;
-# the tenant's ResourceQuota is recomputed as the SUM of these across
-# every Store that currently exists for that tenant.
 PLAN_SIZES = {
     "basic": {
         "cpu_request_m": 150,
@@ -35,8 +28,6 @@ PLAN_SIZES = {
     },
 }
 
-# Hard cap for this portfolio demo: a tenant may deploy at most this many
-# stores at once, in any mix of plans (e.g. 2 pro + 1 basic, or 3 basic).
 MAX_STORES_PER_TENANT = 3
 
 
@@ -44,37 +35,37 @@ def _tenant_ns(tenant_id):
     return f"tenant-{tenant_id}"
 
 
+SETUP_JOB_CPU_REQUEST_M = 50
+SETUP_JOB_MEM_REQUEST_MI = 64
+QUOTA_SAFETY_FACTOR = 1.15
+
+
 def _recompute_quota(tenant_id, custom_api, core_v1, logger, exclude_store_name=None):
-    """
-    Reconciliation step: list every Store belonging to this tenant (optionally
-    excluding one being deleted), sum up each one's plan footprint, and PATCH
-    the tenant's ResourceQuota to match that sum exactly. This runs on every
-    store create AND delete, so the quota always reflects reality rather than
-    a one-time guess.
-    """
     tenant_ns = _tenant_ns(tenant_id)
     all_stores = custom_api.list_namespaced_custom_object(
         group=GROUP, version=VERSION, namespace=REGISTRY_NS, plural="stores"
     )["items"]
-
     relevant = [
         s
         for s in all_stores
         if s["spec"]["tenantId"] == tenant_id
         and s["metadata"]["name"] != exclude_store_name
     ]
-
     total_cpu_m = 0
     total_mem_mi = 0
     total_storage_mi = 0
     total_pvcs = 0
+
     for s in relevant:
         plan = s["spec"]["plan"]
         size = PLAN_SIZES.get(plan, PLAN_SIZES["basic"])
-        total_cpu_m += size["cpu_request_m"]
-        total_mem_mi += size["mem_request_mi"]
+        total_cpu_m += size["cpu_request_m"] + SETUP_JOB_CPU_REQUEST_M
+        total_mem_mi += size["mem_request_mi"] + SETUP_JOB_MEM_REQUEST_MI
         total_storage_mi += size["db_storage_mi"] + size["wp_storage_mi"]
-        total_pvcs += 2  # one PVC for MySQL, one for WordPress, per store
+        total_pvcs += 2
+
+    total_cpu_m = int(total_cpu_m * QUOTA_SAFETY_FACTOR)
+    total_mem_mi = int(total_mem_mi * QUOTA_SAFETY_FACTOR)
 
     hard = {
         "requests.cpu": f"{total_cpu_m}m",
@@ -82,7 +73,6 @@ def _recompute_quota(tenant_id, custom_api, core_v1, logger, exclude_store_name=
         "requests.storage": f"{total_storage_mi}Mi",
         "persistentvolumeclaims": str(total_pvcs),
     }
-
     try:
         core_v1.patch_namespaced_resource_quota(
             name="tenant-quota", namespace=tenant_ns, body={"spec": {"hard": hard}}
@@ -94,12 +84,11 @@ def _recompute_quota(tenant_id, custom_api, core_v1, logger, exclude_store_name=
         if e.status != 404:
             raise
         logger.warning(f"No quota object found in '{tenant_ns}' yet to patch")
-
     return len(relevant)
 
 
 # ============================================================
-# TENANT handlers — the registration boundary. One per customer.
+# TENANT handlers
 # ============================================================
 
 
@@ -112,7 +101,6 @@ def on_tenant_created(spec, name, patch, logger, **kwargs):
     core_v1 = k8s.CoreV1Api()
     networking_v1 = k8s.NetworkingV1Api()
 
-    # --- Namespace ---
     ns_manifest = k8s.V1Namespace(
         metadata=k8s.V1ObjectMeta(
             name=tenant_ns, labels={"factory.example.com/tenant-id": tenant_id}
@@ -126,7 +114,6 @@ def on_tenant_created(spec, name, patch, logger, **kwargs):
             raise
         logger.info(f"Namespace '{tenant_ns}' already exists")
 
-    # --- ResourceQuota, starts at zero (no stores yet); grows as stores are added ---
     quota_manifest = k8s.V1ResourceQuota(
         metadata=k8s.V1ObjectMeta(name="tenant-quota", namespace=tenant_ns),
         spec=k8s.V1ResourceQuotaSpec(
@@ -146,7 +133,6 @@ def on_tenant_created(spec, name, patch, logger, **kwargs):
             raise
         logger.info("ResourceQuota already exists")
 
-    # --- NetworkPolicy: same-tenant pods + Traefik (kube-system) allowed in ---
     netpol_manifest = k8s.V1NetworkPolicy(
         metadata=k8s.V1ObjectMeta(name="deny-cross-tenant", namespace=tenant_ns),
         spec=k8s.V1NetworkPolicySpec(
@@ -186,31 +172,8 @@ def on_tenant_created(spec, name, patch, logger, **kwargs):
     patch.status["storeCount"] = 0
 
 
-@kopf.on.delete(GROUP, VERSION, "tenants")
-def on_tenant_deleted(spec, logger, **kwargs):
-    """
-    Deleting the Tenant ('the registry entry') tears down the WHOLE
-    namespace unconditionally — every store the tenant ever created,
-    regardless of plan, goes with it in one action.
-    """
-    tenant_id = spec["tenantId"]
-    tenant_ns = _tenant_ns(tenant_id)
-    core_v1 = k8s.CoreV1Api()
-    try:
-        core_v1.delete_namespace(tenant_ns)
-        logger.info(
-            f"Namespace '{tenant_ns}' deletion triggered (full tenant teardown)"
-        )
-    except k8s.exceptions.ApiException as e:
-        if e.status != 404:
-            raise
-        logger.info(f"Namespace '{tenant_ns}' already gone")
-
-
 # ============================================================
-# STORE handlers — one per storefront. References a tenantId,
-# chooses its own plan, gets storeId-suffixed resource names so
-# many stores can coexist inside the same tenant namespace.
+# STORE handlers
 # ============================================================
 
 
@@ -231,7 +194,54 @@ def on_store_created(spec, name, patch, logger, **kwargs):
     def suffixed(base):
         return f"{base}-{store_id}"
 
-    # --- Enforce the per-tenant store cap BEFORE provisioning anything ---
+    admin_username = spec.get("adminUsername") or "admin"
+    admin_email = spec.get("adminEmail") or f"admin@{domain}"
+    admin_password = spec.get("adminPassword") or pysecrets.token_urlsafe(12)
+    public_url = f"https://{domain}/"
+    admin_url = f"https://{domain}/wp-admin/"
+
+    # ===== FIX: Wait for tenant namespace to exist =====
+    logger.info(f"[{store_id}] Waiting for tenant namespace '{tenant_ns}' to exist...")
+    for i in range(30):
+        try:
+            ns = core_v1.read_namespace(tenant_ns)
+            if ns.status.phase == "Active":
+                logger.info(f"[{store_id}] Tenant namespace '{tenant_ns}' is ready")
+                break
+        except k8s.exceptions.ApiException as e:
+            if e.status == 404:
+                logger.info(
+                    f"[{store_id}] Namespace '{tenant_ns}' not found yet, waiting..."
+                )
+                time.sleep(2)
+                continue
+            else:
+                raise
+    else:
+        patch.status["phase"] = "Failed"
+        logger.error(f"[{store_id}] Timeout waiting for namespace '{tenant_ns}'")
+        return
+
+    # ===== FIX: Wait for ResourceQuota to exist =====
+    logger.info(f"[{store_id}] Waiting for ResourceQuota in '{tenant_ns}'...")
+    for i in range(30):
+        try:
+            quota = core_v1.read_namespaced_resource_quota("tenant-quota", tenant_ns)
+            logger.info(f"[{store_id}] ResourceQuota exists in '{tenant_ns}'")
+            break
+        except k8s.exceptions.ApiException as e:
+            if e.status == 404:
+                logger.info(f"[{store_id}] ResourceQuota not found yet, waiting...")
+                time.sleep(2)
+                continue
+            else:
+                raise
+    else:
+        patch.status["phase"] = "Failed"
+        logger.error(f"[{store_id}] Timeout waiting for ResourceQuota in '{tenant_ns}'")
+        return
+
+    # --- Enforce store cap ---
     existing = custom_api.list_namespaced_custom_object(
         group=GROUP, version=VERSION, namespace=REGISTRY_NS, plural="stores"
     )["items"]
@@ -250,10 +260,10 @@ def on_store_created(spec, name, patch, logger, **kwargs):
 
     patch.status["phase"] = "Provisioning"
 
-    # --- Recompute (grow) the tenant's quota to include this new store ---
+    # --- Recompute quota ---
     _recompute_quota(tenant_id, custom_api, core_v1, logger)
 
-    # --- Secret for this store's MySQL root password ---
+    # --- Secret for MySQL ---
     db_password = pysecrets.token_urlsafe(16)
     secret_manifest = k8s.V1Secret(
         metadata=k8s.V1ObjectMeta(
@@ -319,10 +329,6 @@ def on_store_created(spec, name, patch, logger, **kwargs):
                             ports=[k8s.V1ContainerPort(container_port=3306)],
                             resources=k8s.V1ResourceRequirements(
                                 requests={
-                                    # MySQL gets ~65% of the store's request share, not
-                                    # an even 50/50 — even with performance_schema off
-                                    # and a capped buffer pool, MySQL's baseline memory
-                                    # need is structurally higher than WordPress's.
                                     "cpu": f"{int(size['cpu_request_m'] * 0.65)}m",
                                     "memory": f"{int(size['mem_request_mi'] * 0.65)}Mi",
                                 },
@@ -362,7 +368,7 @@ def on_store_created(spec, name, patch, logger, **kwargs):
             raise
         logger.info(f"[{store_id}] MySQL StatefulSet already exists")
 
-    # --- WordPress PVC ---
+    # --- WordPress PVC (wait for MySQL PVC to be bound) ---
     wp_pvc_manifest = k8s.V1PersistentVolumeClaim(
         metadata=k8s.V1ObjectMeta(name=suffixed("wp-data"), namespace=tenant_ns),
         spec=k8s.V1PersistentVolumeClaimSpec(
@@ -373,6 +379,21 @@ def on_store_created(spec, name, patch, logger, **kwargs):
             ),
         ),
     )
+
+    for i in range(30):
+        try:
+            pvc = core_v1.read_namespaced_persistent_volume_claim(
+                name=f"data-{suffixed('mysql')}-0", namespace=tenant_ns
+            )
+            if pvc.status and pvc.status.phase == "Bound":
+                logger.info(
+                    f"[{store_id}] MySQL PVC is bound, creating WordPress PVC..."
+                )
+                break
+        except k8s.exceptions.ApiException:
+            pass
+        time.sleep(2)
+
     try:
         core_v1.create_namespaced_persistent_volume_claim(tenant_ns, wp_pvc_manifest)
         logger.info(f"[{store_id}] WordPress PVC created")
@@ -394,7 +415,18 @@ def on_store_created(spec, name, patch, logger, **kwargs):
             ),
         ),
         k8s.V1EnvVar(name="WORDPRESS_DB_NAME", value="wordpress"),
+        k8s.V1EnvVar(
+            name="WORDPRESS_CONFIG_EXTRA",
+            value="""
+$_SERVER['HTTPS'] = 'on';
+if (isset($_SERVER['HTTP_X_FORWARDED_PROTO']) && $_SERVER['HTTP_X_FORWARDED_PROTO'] === 'https') {
+    $_SERVER['HTTPS'] = 'on';
+}
+define('FORCE_SSL_ADMIN', true);
+""",
+        ),
     ]
+
     wp_deployment_manifest = k8s.V1Deployment(
         metadata=k8s.V1ObjectMeta(name=suffixed("wordpress"), namespace=tenant_ns),
         spec=k8s.V1DeploymentSpec(
@@ -403,6 +435,41 @@ def on_store_created(spec, name, patch, logger, **kwargs):
             template=k8s.V1PodTemplateSpec(
                 metadata=k8s.V1ObjectMeta(labels={"app": suffixed("wordpress")}),
                 spec=k8s.V1PodSpec(
+                    init_containers=[
+                        k8s.V1Container(
+                            name="copy-wordpress-files",
+                            image="wordpress:php8.2-apache",
+                            command=["sh", "-c"],
+                            args=[
+                                """
+                                if [ ! -f /var/www/html/wp-load.php ]; then
+                                    echo "Copying WordPress files to PVC..."
+                                    cp -r /usr/src/wordpress/* /var/www/html/
+                                    chown -R www-data:www-data /var/www/html
+                                    echo "WordPress files copied successfully!"
+                                else
+                                    echo "WordPress files already exist on PVC."
+                                fi
+                                """
+                            ],
+                            # ===== ADD RESOURCES HERE =====
+                            resources=k8s.V1ResourceRequirements(
+                                requests={
+                                    "cpu": "50m",
+                                    "memory": "64Mi",
+                                },
+                                limits={
+                                    "cpu": "100m",
+                                    "memory": "128Mi",
+                                },
+                            ),
+                            volume_mounts=[
+                                k8s.V1VolumeMount(
+                                    name="wp-data", mount_path="/var/www/html"
+                                )
+                            ],
+                        )
+                    ],
                     containers=[
                         k8s.V1Container(
                             name="wordpress",
@@ -446,6 +513,7 @@ def on_store_created(spec, name, patch, logger, **kwargs):
             raise
         logger.info(f"[{store_id}] WordPress Deployment already exists")
 
+    # --- WordPress Service ---
     wp_svc_manifest = k8s.V1Service(
         metadata=k8s.V1ObjectMeta(name=suffixed("wordpress"), namespace=tenant_ns),
         spec=k8s.V1ServiceSpec(
@@ -461,33 +529,119 @@ def on_store_created(spec, name, patch, logger, **kwargs):
             raise
         logger.info(f"[{store_id}] WordPress Service already exists")
 
-    # --- One-time Job: wp core install + activate WooCommerce ---
-    setup_script = f"""
+    # --- Setup Job ---
+    setup_script = """
 set -e
-until wp core is-installed --path=/var/www/html --allow-root 2>/dev/null; do
-  echo "WordPress not installed yet, attempting install..."
-  wp core install --path=/var/www/html --allow-root \
-    --url="{domain}" \
-    --title="{store_id} ({plan})" \
-    --admin_user=admin \
-    --admin_password="{ADMIN_PASSWORD}" \
-    --admin_email="admin@{domain}" && break
-  echo "Install failed, likely DB not ready yet — retrying in 5s"
-  sleep 5
-done
-echo "WordPress core install confirmed."
 
-if wp plugin is-active woocommerce --path=/var/www/html --allow-root 2>/dev/null; then
-  echo "WooCommerce already active."
-else
-  echo "Installing and activating WooCommerce..."
-  wp plugin install woocommerce --activate --path=/var/www/html --allow-root
+echo "=== Starting WordPress setup ==="
+
+echo "Waiting for WordPress files..."
+for i in 1 2 3 4 5 6 7 8 9 10; do
+    if [ -f /var/www/html/wp-load.php ]; then
+    echo "✅ WordPress files found!"
+    break
+    fi
+    echo "Waiting... $i/10"
+    sleep 3
+done
+
+if [ ! -f /var/www/html/wp-load.php ]; then
+    echo "❌ WordPress files not found! Exiting..."
+    exit 1
 fi
+
+echo "Waiting for MySQL..."
+# Use PHP's mysqli (same client WordPress itself uses) instead of the `mysql`
+# CLI binary: this image's bundled MariaDB client can't complete a connection
+# against MySQL 8's default caching_sha2_password + self-signed TLS setup
+# (missing caching_sha2_password plugin, and rejects the self-signed cert).
+# The connection check must be the loop's own condition — as a standalone
+# statement before the loop, a failing first attempt trips `set -e` and kills
+# the script before any retry ever runs.
+until php -r '$m=@mysqli_connect(getenv("WORDPRESS_DB_HOST"), "root", getenv("MYSQL_ROOT_PASSWORD")); exit($m ? 0 : 1);'; do
+    echo "Waiting for MySQL... (retry)"
+    sleep 3
+done
+echo "✅ MySQL is ready!"
+
+echo "Checking wp-config.php..."
+if [ ! -f /var/www/html/wp-config.php ]; then
+    echo "Creating wp-config.php..."
+    # Use MYSQL_PWD environment variable instead of --pass to avoid escaping issues
+    wp config create --path=/var/www/html --allow-root \
+    --dbname=wordpress \
+    --dbuser=root \
+    --dbpass="$MYSQL_ROOT_PASSWORD" \
+    --dbhost="$WORDPRESS_DB_HOST" \
+    --skip-check
+
+    # Add HTTPS settings
+    echo 'if (isset($_SERVER["HTTP_X_FORWARDED_PROTO"]) && $_SERVER["HTTP_X_FORWARDED_PROTO"] === "https") { $_SERVER["HTTPS"] = "on"; }' >> /var/www/html/wp-config.php
+    echo "define('FORCE_SSL_ADMIN', true);" >> /var/www/html/wp-config.php
+    echo "✅ wp-config.php created"
+else
+    echo "✅ wp-config.php already exists"
+fi
+
+echo "Installing WordPress..."
+if ! wp core is-installed --path=/var/www/html --allow-root 2>/dev/null; then
+    wp core install --path=/var/www/html --allow-root \
+    --url="$SITE_URL" \
+    --title="$SITE_TITLE" \
+    --admin_user="$ADMIN_USER" \
+    --admin_password="$ADMIN_PASSWORD" \
+    --admin_email="$ADMIN_EMAIL"
+    echo "✅ WordPress installed!"
+else
+    echo "✅ WordPress already installed"
+fi
+
+echo "Installing WooCommerce..."
+if ! wp plugin is-active woocommerce --path=/var/www/html --allow-root 2>/dev/null; then
+    wp plugin install woocommerce --activate --path=/var/www/html --allow-root
+    echo "✅ WooCommerce installed!"
+else
+    echo "✅ WooCommerce already active"
+fi
+
+echo "Seeding dummy products..."
+EXISTING_PRODUCTS=$(wp post list --post_type=product --format=count --path=/var/www/html --allow-root)
+if [ "$EXISTING_PRODUCTS" -eq "0" ]; then
+    wp wc product create --path=/var/www/html --user="$ADMIN_USER" \
+        --name="Sample Tee" --type=simple --regular_price="19.99" \
+        --description="A comfortable everyday t-shirt." --allow-root
+    wp wc product create --path=/var/www/html --user="$ADMIN_USER" \
+        --name="Sample Mug" --type=simple --regular_price="12.50" \
+        --description="A sturdy ceramic mug for your morning coffee." --allow-root
+    wp wc product create --path=/var/www/html --user="$ADMIN_USER" \
+        --name="Sample Tote Bag" --type=simple --regular_price="15.00" \
+        --description="A durable canvas tote bag." --allow-root
+    echo "✅ Dummy products created!"
+else
+    echo "✅ Products already exist ($EXISTING_PRODUCTS found), skipping seed"
+fi
+
+echo "Setting Shop page as homepage..."
+# WooCommerce creates its "Shop" page on activation but does NOT make it the
+# site's front page — without this, "/" shows WordPress's default page/blog
+# and products are only visible by navigating to /shop directly.
+SHOP_PAGE_ID=$(wp option get woocommerce_shop_page_id --path=/var/www/html --allow-root)
+if [ -n "$SHOP_PAGE_ID" ] && [ "$SHOP_PAGE_ID" != "0" ]; then
+    wp option update show_on_front page --path=/var/www/html --allow-root
+    wp option update page_on_front "$SHOP_PAGE_ID" --path=/var/www/html --allow-root
+    echo "✅ Shop page set as homepage!"
+else
+    echo "⚠️ Could not find WooCommerce shop page ID, leaving default homepage"
+fi
+
+echo "=== 🎉 Store setup complete! ==="
 """
+
     job_manifest = k8s.V1Job(
         metadata=k8s.V1ObjectMeta(name=suffixed("wp-setup"), namespace=tenant_ns),
         spec=k8s.V1JobSpec(
-            backoff_limit=4,
+            backoff_limit=3,
+            ttl_seconds_after_finished=300,
             template=k8s.V1PodTemplateSpec(
                 spec=k8s.V1PodSpec(
                     restart_policy="OnFailure",
@@ -496,9 +650,71 @@ fi
                             name="wp-cli",
                             image="wordpress:cli-php8.2",
                             command=["sh", "-c", setup_script],
+                            env=[
+                                k8s.V1EnvVar(
+                                    name="MYSQL_ROOT_PASSWORD",
+                                    value_from=k8s.V1EnvVarSource(
+                                        secret_key_ref=k8s.V1SecretKeySelector(
+                                            name=suffixed("mysql-credentials"),
+                                            key="MYSQL_ROOT_PASSWORD",
+                                        )
+                                    ),
+                                ),
+                                # These also match the WORDPRESS_DB_* names getenv_docker()
+                                # reads from wp-config.php, in case the WordPress pod's
+                                # entrypoint already generated that file on the shared PVC
+                                # before this Job ran (skipping this script's own `wp config
+                                # create` step).
+                                k8s.V1EnvVar(
+                                    name="WORDPRESS_DB_USER",
+                                    value="root",
+                                ),
+                                k8s.V1EnvVar(
+                                    name="WORDPRESS_DB_PASSWORD",
+                                    value_from=k8s.V1EnvVarSource(
+                                        secret_key_ref=k8s.V1SecretKeySelector(
+                                            name=suffixed("mysql-credentials"),
+                                            key="MYSQL_ROOT_PASSWORD",
+                                        )
+                                    ),
+                                ),
+                                k8s.V1EnvVar(
+                                    name="WORDPRESS_DB_NAME",
+                                    value="wordpress",
+                                ),
+                                k8s.V1EnvVar(
+                                    name="WORDPRESS_DB_HOST",
+                                    value=suffixed("mysql"),
+                                ),
+                                k8s.V1EnvVar(name="SITE_URL", value=public_url),
+                                k8s.V1EnvVar(
+                                    name="SITE_TITLE", value=f"{store_id} ({plan})"
+                                ),
+                                k8s.V1EnvVar(name="ADMIN_USER", value=admin_username),
+                                k8s.V1EnvVar(
+                                    name="ADMIN_PASSWORD", value=admin_password
+                                ),
+                                k8s.V1EnvVar(name="ADMIN_EMAIL", value=admin_email),
+                            ],
+                            # wordpress:php8.2-apache (Debian) and wordpress:cli-php8.2
+                            # (Alpine) both have a "www-data" user, but at different
+                            # numeric UIDs (33 vs 82). The PVC's files are owned by uid 33
+                            # (created by the Apache image), so without pinning this
+                            # container to the same uid/gid it can't write into
+                            # wp-content/ (e.g. the WooCommerce plugin install fails).
+                            security_context=k8s.V1SecurityContext(
+                                run_as_user=33, run_as_group=33
+                            ),
                             resources=k8s.V1ResourceRequirements(
+                                # Request stays small so it fits the tenant's
+                                # tight quota (only requests.* is quota-capped,
+                                # not limits.*); the limit is raised well above
+                                # it because installing WordPress core + the
+                                # WooCommerce plugin zip needs real headroom —
+                                # too tight a limit here causes a silent OOM
+                                # kill mid-script with no error output.
                                 requests={"cpu": "50m", "memory": "64Mi"},
-                                limits={"cpu": "150m", "memory": "128Mi"},
+                                limits={"cpu": "300m", "memory": "384Mi"},
                             ),
                             volume_mounts=[
                                 k8s.V1VolumeMount(
@@ -552,13 +768,33 @@ fi
             raise
         logger.info(f"[{store_id}] Certificate already exists")
 
-    # --- Traefik IngressRoute ---
-    ingressroute_manifest = {
+    # --- Traefik IngressRoutes ---
+    # NOTE: a single IngressRoute listing both "web" and "websecure" alongside a
+    # top-level `tls` block causes Traefik to bind the plain-HTTP "web" router
+    # into its TLS-only routing table, so it never matches unencrypted requests
+    # (falls through to the default 404). Split into two IngressRoutes so HTTP
+    # keeps working independently of the HTTPS/TLS one.
+    http_ingressroute_manifest = {
         "apiVersion": "traefik.io/v1alpha1",
         "kind": "IngressRoute",
-        "metadata": {"name": suffixed("wordpress-route"), "namespace": tenant_ns},
+        "metadata": {"name": suffixed("wordpress-route-http"), "namespace": tenant_ns},
         "spec": {
-            "entryPoints": ["web", "websecure"],
+            "entryPoints": ["web"],
+            "routes": [
+                {
+                    "match": f"Host(`{domain}`)",
+                    "kind": "Rule",
+                    "services": [{"name": suffixed("wordpress"), "port": 80}],
+                }
+            ],
+        },
+    }
+    https_ingressroute_manifest = {
+        "apiVersion": "traefik.io/v1alpha1",
+        "kind": "IngressRoute",
+        "metadata": {"name": suffixed("wordpress-route-https"), "namespace": tenant_ns},
+        "spec": {
+            "entryPoints": ["websecure"],
             "routes": [
                 {
                     "match": f"Host(`{domain}`)",
@@ -569,29 +805,38 @@ fi
             "tls": {"secretName": suffixed("tls-secret")},
         },
     }
-    try:
-        custom_api.create_namespaced_custom_object(
-            group="traefik.io",
-            version="v1alpha1",
-            namespace=tenant_ns,
-            plural="ingressroutes",
-            body=ingressroute_manifest,
-        )
-        logger.info(f"[{store_id}] IngressRoute created for '{domain}'")
-    except k8s.exceptions.ApiException as e:
-        if e.status != 409:
-            raise
-        logger.info(f"[{store_id}] IngressRoute already exists")
+    for ingressroute_manifest in (http_ingressroute_manifest, https_ingressroute_manifest):
+        try:
+            custom_api.create_namespaced_custom_object(
+                group="traefik.io",
+                version="v1alpha1",
+                namespace=tenant_ns,
+                plural="ingressroutes",
+                body=ingressroute_manifest,
+            )
+            logger.info(
+                f"[{store_id}] IngressRoute '{ingressroute_manifest['metadata']['name']}' created for '{domain}'"
+            )
+        except k8s.exceptions.ApiException as e:
+            if e.status != 409:
+                raise
+            logger.info(
+                f"[{store_id}] IngressRoute '{ingressroute_manifest['metadata']['name']}' already exists"
+            )
 
     patch.status["phase"] = "Ready"
+    patch.status["publicUrl"] = public_url
+    patch.status["adminUrl"] = admin_url
 
 
 @kopf.on.delete(GROUP, VERSION, "stores")
 def on_store_deleted(spec, name, logger, **kwargs):
     """
-    Deletes ONLY this store's resources (not the tenant namespace, not other
-    stores), then shrinks the tenant's quota back down to match whatever
-    stores remain.
+    Deleting a Store CR only removes that CR — nothing else is owned by it
+    (no ownerReferences), so without this handler every resource
+    on_store_created made (MySQL, WordPress, PVCs, Job, Certificate,
+    IngressRoutes) would keep running orphaned, unbilled and untracked by
+    quota recompute, forever.
     """
     tenant_id = spec["tenantId"]
     store_id = spec["storeId"]
@@ -605,77 +850,199 @@ def on_store_deleted(spec, name, logger, **kwargs):
     def suffixed(base):
         return f"{base}-{store_id}"
 
-    deletions = [
-        (
-            custom_api.delete_namespaced_custom_object,
-            dict(
-                group="traefik.io",
-                version="v1alpha1",
-                namespace=tenant_ns,
-                plural="ingressroutes",
-                name=suffixed("wordpress-route"),
-            ),
-        ),
-        (
-            custom_api.delete_namespaced_custom_object,
-            dict(
-                group="cert-manager.io",
-                version="v1",
-                namespace=tenant_ns,
-                plural="certificates",
-                name=suffixed("tls-cert"),
-            ),
-        ),
-        (
-            batch_v1.delete_namespaced_job,
-            dict(
-                namespace=tenant_ns,
-                name=suffixed("wp-setup"),
-                propagation_policy="Background",
-            ),
-        ),
-        (
-            core_v1.delete_namespaced_service,
-            dict(namespace=tenant_ns, name=suffixed("wordpress")),
-        ),
-        (
-            apps_v1.delete_namespaced_deployment,
-            dict(namespace=tenant_ns, name=suffixed("wordpress")),
-        ),
-        (
-            core_v1.delete_namespaced_persistent_volume_claim,
-            dict(namespace=tenant_ns, name=suffixed("wp-data")),
-        ),
-        (
-            apps_v1.delete_namespaced_stateful_set,
-            dict(namespace=tenant_ns, name=suffixed("mysql")),
-        ),
-        (
-            core_v1.delete_namespaced_persistent_volume_claim,
-            dict(namespace=tenant_ns, name=suffixed("data-mysql-0")),
-        ),  # StatefulSet-generated PVC name
-        (
-            core_v1.delete_namespaced_service,
-            dict(namespace=tenant_ns, name=suffixed("mysql")),
-        ),
-        (
-            core_v1.delete_namespaced_secret,
-            dict(namespace=tenant_ns, name=suffixed("mysql-credentials")),
-        ),
-    ]
+    logger.info(f"[{store_id}] Tearing down store resources in '{tenant_ns}'...")
 
-    for fn, kwargs_ in deletions:
+    def _delete(label, fn):
         try:
-            fn(**kwargs_)
-            logger.info(f"[{store_id}] deleted {kwargs_.get('name')}")
+            fn()
+            logger.info(f"[{store_id}] Deleted {label}")
         except k8s.exceptions.ApiException as e:
             if e.status != 404:
                 raise
-            logger.info(f"[{store_id}] {kwargs_.get('name')} already gone")
+            logger.info(f"[{store_id}] {label} already gone")
 
+    _delete(
+        f"IngressRoute '{suffixed('wordpress-route-https')}'",
+        lambda: custom_api.delete_namespaced_custom_object(
+            "traefik.io", "v1alpha1", tenant_ns, "ingressroutes",
+            suffixed("wordpress-route-https"),
+        ),
+    )
+    _delete(
+        f"IngressRoute '{suffixed('wordpress-route-http')}'",
+        lambda: custom_api.delete_namespaced_custom_object(
+            "traefik.io", "v1alpha1", tenant_ns, "ingressroutes",
+            suffixed("wordpress-route-http"),
+        ),
+    )
+    _delete(
+        f"Certificate '{suffixed('tls-cert')}'",
+        lambda: custom_api.delete_namespaced_custom_object(
+            "cert-manager.io", "v1", tenant_ns, "certificates", suffixed("tls-cert"),
+        ),
+    )
+    _delete(
+        f"Secret '{suffixed('tls-secret')}'",
+        lambda: core_v1.delete_namespaced_secret(suffixed("tls-secret"), tenant_ns),
+    )
+    _delete(
+        f"Job '{suffixed('wp-setup')}'",
+        lambda: batch_v1.delete_namespaced_job(
+            suffixed("wp-setup"), tenant_ns,
+            propagation_policy="Background",
+        ),
+    )
+    _delete(
+        f"Service '{suffixed('wordpress')}'",
+        lambda: core_v1.delete_namespaced_service(suffixed("wordpress"), tenant_ns),
+    )
+    _delete(
+        f"Deployment '{suffixed('wordpress')}'",
+        lambda: apps_v1.delete_namespaced_deployment(
+            suffixed("wordpress"), tenant_ns,
+            propagation_policy="Background",
+        ),
+    )
+    _delete(
+        f"PVC '{suffixed('wp-data')}'",
+        lambda: core_v1.delete_namespaced_persistent_volume_claim(
+            suffixed("wp-data"), tenant_ns,
+        ),
+    )
+    _delete(
+        f"StatefulSet '{suffixed('mysql')}'",
+        lambda: apps_v1.delete_namespaced_stateful_set(
+            suffixed("mysql"), tenant_ns,
+            propagation_policy="Background",
+        ),
+    )
+    # StatefulSet volumeClaimTemplates create their own PVC that survives the
+    # StatefulSet's deletion by design (data safety) — must be removed explicitly.
+    _delete(
+        f"PVC '{f'data-{suffixed('mysql')}-0'}'",
+        lambda: core_v1.delete_namespaced_persistent_volume_claim(
+            f"data-{suffixed('mysql')}-0", tenant_ns,
+        ),
+    )
+    _delete(
+        f"Service '{suffixed('mysql')}'",
+        lambda: core_v1.delete_namespaced_service(suffixed("mysql"), tenant_ns),
+    )
+    _delete(
+        f"Secret '{suffixed('mysql-credentials')}'",
+        lambda: core_v1.delete_namespaced_secret(
+            suffixed("mysql-credentials"), tenant_ns,
+        ),
+    )
+
+    # kopf's on.delete handler runs before the CR is actually removed (it holds
+    # a finalizer until this returns), so the store being deleted is still
+    # visible to _recompute_quota's own listing — exclude it explicitly.
     remaining = _recompute_quota(
         tenant_id, custom_api, core_v1, logger, exclude_store_name=name
     )
     logger.info(
-        f"Store '{store_id}' torn down. Tenant '{tenant_id}' now has {remaining} store(s)."
+        f"[{store_id}] Store teardown complete; {remaining} store(s) remain for '{tenant_ns}'"
     )
+
+
+@kopf.on.delete(GROUP, VERSION, "tenants")
+def on_tenant_deleted(spec, logger, **kwargs):
+    """
+    Deleting the Tenant ('the registry entry') tears down the WHOLE
+    namespace unconditionally — every store the tenant ever created,
+    regardless of plan, goes with it in one action.
+    """
+    tenant_id = spec["tenantId"]
+    tenant_ns = _tenant_ns(tenant_id)
+    core_v1 = k8s.CoreV1Api()
+    apps_v1 = k8s.AppsV1Api()
+    batch_v1 = k8s.BatchV1Api()
+
+    logger.info(f"Starting full tenant teardown for '{tenant_ns}'...")
+
+    # ===== FIX: Delete ALL resources in the namespace first =====
+    try:
+        # Delete all deployments
+        deployments = apps_v1.list_namespaced_deployment(tenant_ns)
+        for dep in deployments.items:
+            apps_v1.delete_namespaced_deployment(dep.metadata.name, tenant_ns)
+            logger.info(f"Deleted deployment: {dep.metadata.name}")
+    except k8s.exceptions.ApiException as e:
+        if e.status != 404:
+            raise
+
+    try:
+        # Delete all statefulsets
+        statefulsets = apps_v1.list_namespaced_stateful_set(tenant_ns)
+        for sts in statefulsets.items:
+            apps_v1.delete_namespaced_stateful_set(sts.metadata.name, tenant_ns)
+            logger.info(f"Deleted statefulset: {sts.metadata.name}")
+    except k8s.exceptions.ApiException as e:
+        if e.status != 404:
+            raise
+
+    try:
+        # Delete all jobs
+        jobs = batch_v1.list_namespaced_job(tenant_ns)
+        for job in jobs.items:
+            batch_v1.delete_namespaced_job(
+                job.metadata.name, tenant_ns, propagation_policy="Background"
+            )
+            logger.info(f"Deleted job: {job.metadata.name}")
+    except k8s.exceptions.ApiException as e:
+        if e.status != 404:
+            raise
+
+    try:
+        # Delete all services
+        services = core_v1.list_namespaced_service(tenant_ns)
+        for svc in services.items:
+            core_v1.delete_namespaced_service(svc.metadata.name, tenant_ns)
+            logger.info(f"Deleted service: {svc.metadata.name}")
+    except k8s.exceptions.ApiException as e:
+        if e.status != 404:
+            raise
+
+    try:
+        # ===== CRITICAL: Delete ALL PVCs =====
+        pvcs = core_v1.list_namespaced_persistent_volume_claim(tenant_ns)
+        for pvc in pvcs.items:
+            # Remove finalizers from PVC
+            try:
+                core_v1.patch_namespaced_persistent_volume_claim(
+                    pvc.metadata.name, tenant_ns, body={"metadata": {"finalizers": []}}
+                )
+            except:
+                pass
+            # Delete the PVC
+            core_v1.delete_namespaced_persistent_volume_claim(
+                pvc.metadata.name, tenant_ns
+            )
+            logger.info(f"Deleted PVC: {pvc.metadata.name}")
+    except k8s.exceptions.ApiException as e:
+        if e.status != 404:
+            raise
+
+    try:
+        # Delete all secrets
+        secrets = core_v1.list_namespaced_secret(tenant_ns)
+        for secret in secrets.items:
+            if secret.metadata.name.startswith("mysql-credentials"):
+                core_v1.delete_namespaced_secret(secret.metadata.name, tenant_ns)
+                logger.info(f"Deleted secret: {secret.metadata.name}")
+    except k8s.exceptions.ApiException as e:
+        if e.status != 404:
+            raise
+
+    # ===== Finally, delete the namespace =====
+    try:
+        # Remove finalizers from namespace
+        core_v1.patch_namespace(tenant_ns, body={"metadata": {"finalizers": []}})
+        # Delete the namespace
+        core_v1.delete_namespace(tenant_ns)
+        logger.info(f"Namespace '{tenant_ns}' deletion triggered")
+    except k8s.exceptions.ApiException as e:
+        if e.status != 404:
+            raise
+        logger.info(f"Namespace '{tenant_ns}' already gone")

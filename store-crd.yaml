@@ -32,12 +32,22 @@ spec:
                 plan:
                   type: string
                   enum: ["basic", "pro"]
+                adminUsername:
+                  type: string
+                adminEmail:
+                  type: string
+                adminPassword:
+                  type: string
             status:
               type: object
               properties:
                 phase:
                   type: string
                   enum: ["Pending", "Provisioning", "Ready", "Failed"]
+                publicUrl:
+                  type: string
+                adminUrl:
+                  type: string
       subresources:
         status: {}
       additionalPrinterColumns:

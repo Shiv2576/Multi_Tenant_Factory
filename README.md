@@ -1,4 +1,6 @@
-uv run kopf run operator.py --namespace factory-system
+for operator.py : uv run kopf run operator.py --namespace factory-system
+
+for control-plane-api : uv run uvicorn main:app --reload --port 8000
 
 problem faced in live store upgradation.
 

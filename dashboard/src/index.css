@@ -1,0 +1,611 @@
+/* ============================================================
+   Design tokens — "factory floor status board"
+   ============================================================ */
+:root {
+    /* Color */
+    --bg-void: #0a0e14;
+    --bg-panel: #10151d;
+    --bg-panel-raised: #161c26;
+    --line: #232b38;
+    --line-bright: #37414f;
+    --text-primary: #e7eaf0;
+    --text-muted: #7c8798;
+    --text-faint: #4a5464;
+
+    --signal-pending: #f5a623;
+    --signal-pending-dim: #6b4d1a;
+    --signal-live: #3fce7e;
+    --signal-live-dim: #1f5238;
+    --signal-fault: #e5484d;
+    --signal-fault-dim: #5c2224;
+    --signal-info: #5b8def;
+
+    /* Type */
+    --font-mono: "IBM Plex Mono", ui-monospace, monospace;
+    --font-sans: "IBM Plex Sans", system-ui, sans-serif;
+
+    /* Layout */
+    --radius: 3px;
+    --gap: 20px;
+}
+
+* {
+    box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+    height: 100%;
+}
+
+body {
+    margin: 0;
+    background: var(--bg-void);
+    background-image:
+        linear-gradient(var(--line) 1px, transparent 1px),
+        linear-gradient(90deg, var(--line) 1px, transparent 1px);
+    background-size: 32px 32px;
+    background-attachment: fixed;
+    color: var(--text-primary);
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+}
+
+button {
+    font-family: inherit;
+    cursor: pointer;
+}
+
+button:focus-visible,
+input:focus-visible,
+select:focus-visible {
+    outline: 2px solid var(--signal-info);
+    outline-offset: 2px;
+}
+
+input,
+select {
+    font-family: var(--font-mono);
+    background: var(--bg-void);
+    border: 1px solid var(--line-bright);
+    color: var(--text-primary);
+    border-radius: var(--radius);
+    padding: 9px 10px;
+    font-size: 13px;
+}
+
+input::placeholder {
+    color: var(--text-faint);
+}
+
+.mono {
+    font-family: var(--font-mono);
+}
+
+/* ---------- App shell ---------- */
+.shell {
+    min-height: 100%;
+    display: grid;
+    grid-template-columns: 320px 1fr;
+}
+
+@media (max-width: 860px) {
+    .shell {
+        grid-template-columns: 1fr;
+    }
+}
+
+.auth-shell {
+    min-height: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+    background:
+        radial-gradient(circle at 20% 15%, rgba(91, 141, 239, 0.08), transparent 40%),
+        var(--bg-void);
+}
+
+.auth-card {
+    width: 100%;
+    max-width: 360px;
+    background: var(--bg-panel);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 32px 28px;
+}
+
+.auth-card .brand,
+.auth-card .brand-sub {
+    justify-content: center;
+    text-align: center;
+}
+
+.auth-card .brand {
+    justify-content: center;
+}
+
+.auth-card .btn + .btn {
+    margin-top: 10px;
+}
+
+.rail {
+    border-right: 1px solid var(--line);
+    background: linear-gradient(180deg, var(--bg-panel), var(--bg-void));
+    padding: 28px 22px;
+}
+
+.main {
+    padding: 28px 32px;
+}
+
+.brand {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    margin-bottom: 4px;
+}
+
+.brand-mark {
+    width: 10px;
+    height: 10px;
+    background: var(--signal-pending);
+    border-radius: 1px;
+    transform: rotate(45deg);
+}
+
+.brand-title {
+    font-family: var(--font-mono);
+    font-size: 15px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+}
+
+.brand-sub {
+    color: var(--text-muted);
+    font-size: 12px;
+    margin: 0 0 28px;
+    font-family: var(--font-mono);
+}
+
+.field-label {
+    display: block;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--text-muted);
+    margin-bottom: 6px;
+    font-family: var(--font-mono);
+}
+
+.field {
+    margin-bottom: 16px;
+}
+
+.field input,
+.field select {
+    width: 100%;
+}
+
+.password-field {
+    position: relative;
+    width: 100%;
+}
+
+.password-field input {
+    width: 100%;
+    padding-right: 34px;
+}
+
+.password-field-toggle {
+    position: absolute;
+    top: 50%;
+    right: 6px;
+    transform: translateY(-50%);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 24px;
+    height: 24px;
+    padding: 0;
+    background: transparent;
+    border: none;
+    border-radius: var(--radius);
+    color: var(--text-faint);
+    transition: color 0.12s ease, background 0.12s ease;
+}
+
+.password-field-toggle:hover {
+    color: var(--text-primary);
+    background: var(--bg-panel-raised);
+}
+
+.btn {
+    width: 100%;
+    border: 1px solid var(--line-bright);
+    background: var(--bg-panel-raised);
+    color: var(--text-primary);
+    border-radius: var(--radius);
+    padding: 10px 14px;
+    font-size: 13px;
+    font-weight: 500;
+    transition:
+        border-color 0.15s ease,
+        background 0.15s ease;
+}
+
+.btn:hover {
+    border-color: var(--signal-pending);
+}
+
+.btn-primary {
+    background: var(--signal-pending);
+    border-color: var(--signal-pending);
+    color: #1a1206;
+    font-weight: 600;
+}
+
+.btn-primary:hover {
+    background: #ffb638;
+}
+
+.btn-danger-ghost {
+    background: transparent;
+    border-color: var(--line-bright);
+    color: var(--text-muted);
+}
+
+.btn-danger-ghost:hover {
+    border-color: var(--signal-fault);
+    color: var(--signal-fault);
+}
+
+.btn:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+}
+
+.divider {
+    border: none;
+    border-top: 1px solid var(--line);
+    margin: 24px 0;
+}
+
+.error-banner {
+    background: rgba(229, 72, 77, 0.1);
+    border: 1px solid var(--signal-fault-dim);
+    color: #ff9a9d;
+    font-size: 12.5px;
+    padding: 10px 12px;
+    border-radius: var(--radius);
+    margin-bottom: 16px;
+    font-family: var(--font-mono);
+}
+
+/* ---------- Tenant status card in rail ---------- */
+.tenant-card {
+    background: var(--bg-panel-raised);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    padding: 14px;
+    margin-top: 18px;
+}
+
+.tenant-card .btn {
+    margin-top: 14px;
+}
+
+.tenant-card .btn + .btn {
+    margin-top: 8px;
+}
+
+.tenant-card-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    font-size: 12.5px;
+    margin-bottom: 6px;
+}
+
+.tenant-card-row:last-child {
+    margin-bottom: 0;
+}
+
+.tenant-card-key {
+    color: var(--text-muted);
+    font-family: var(--font-mono);
+}
+
+.tenant-card-val {
+    font-family: var(--font-mono);
+    font-weight: 500;
+}
+
+/* ---------- Main header ---------- */
+.main-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-end;
+    margin-bottom: 26px;
+    padding-bottom: 18px;
+    border-bottom: 1px solid var(--line);
+}
+
+.main-title {
+    font-size: 20px;
+    font-weight: 700;
+    margin: 0 0 4px;
+}
+
+.main-caption {
+    color: var(--text-muted);
+    font-size: 13px;
+    margin: 0;
+}
+
+.capacity-readout {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: var(--text-muted);
+    text-align: right;
+}
+
+.capacity-readout b {
+    color: var(--text-primary);
+    font-size: 15px;
+}
+
+/* ---------- Store slots grid ---------- */
+.slots {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: var(--gap);
+}
+
+@media (max-width: 720px) {
+    .slots {
+        grid-template-columns: 1fr;
+    }
+}
+
+.slot {
+    min-height: 220px;
+    border-radius: 6px;
+    padding: 18px;
+    display: flex;
+    flex-direction: column;
+}
+
+.slot-empty {
+    border: 1.5px dashed var(--line-bright);
+    align-items: center;
+    justify-content: center;
+    color: var(--text-faint);
+    background: rgba(255, 255, 255, 0.01);
+    transition:
+        border-color 0.15s ease,
+        color 0.15s ease;
+}
+
+.slot-empty:hover:not(:disabled) {
+    border-color: var(--signal-pending);
+    color: var(--signal-pending);
+}
+
+.slot-empty-plus {
+    font-size: 26px;
+    line-height: 1;
+    margin-bottom: 6px;
+    font-family: var(--font-mono);
+}
+
+.slot-empty-label {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    font-family: var(--font-mono);
+}
+
+.slot-filled {
+    background: var(--bg-panel);
+    border: 1px solid var(--line);
+    position: relative;
+    overflow: hidden;
+}
+
+.slot-filled::before {
+    content: "";
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 3px;
+}
+
+.slot-filled[data-phase="Ready"]::before {
+    background: var(--signal-live);
+}
+
+.slot-filled[data-phase="Provisioning"]::before,
+.slot-filled[data-phase="Pending"]::before {
+    background: var(--signal-pending);
+}
+
+.slot-filled[data-phase="Failed"]::before {
+    background: var(--signal-fault);
+}
+
+.slot-filled[data-phase="Deleting"]::before {
+    background: var(--text-faint);
+}
+
+.slot-top {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+}
+
+.slot-storeid {
+    font-family: var(--font-mono);
+    font-size: 16px;
+    font-weight: 600;
+}
+
+.plan-badge {
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    padding: 3px 7px;
+    border-radius: 3px;
+    border: 1px solid var(--line-bright);
+    color: var(--text-muted);
+}
+
+.plan-badge[data-plan="pro"] {
+    border-color: var(--signal-info);
+    color: var(--signal-info);
+}
+
+.slot-domain {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: var(--text-muted);
+    margin-top: 10px;
+    word-break: break-all;
+}
+
+.slot-links {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-top: 10px;
+}
+
+.slot-link {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    letter-spacing: 0.02em;
+    padding: 4px 8px;
+    border-radius: var(--radius);
+    border: 1px solid var(--line-bright);
+    color: var(--text-muted);
+    text-decoration: none;
+    transition: border-color 0.12s ease, color 0.12s ease, background 0.12s ease;
+}
+
+.slot-link-dot {
+    width: 5px;
+    height: 5px;
+    border-radius: 50%;
+    background: currentColor;
+    opacity: 0.7;
+    flex-shrink: 0;
+}
+
+.slot-link-arrow {
+    opacity: 0.5;
+    transition: transform 0.12s ease, opacity 0.12s ease;
+}
+
+.slot-link:hover {
+    color: var(--text-primary);
+    background: var(--bg-panel-raised);
+}
+
+.slot-link:hover .slot-link-arrow {
+    opacity: 1;
+    transform: translate(1px, -1px);
+}
+
+.slot-link-public:hover {
+    border-color: var(--signal-live);
+    color: var(--signal-live);
+}
+
+.slot-link-admin:hover {
+    border-color: var(--signal-info);
+    color: var(--signal-info);
+}
+
+.slot-status-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: auto;
+    padding-top: 14px;
+}
+
+.status-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    flex-shrink: 0;
+}
+
+.status-dot[data-phase="Ready"] {
+    background: var(--signal-live);
+    box-shadow: 0 0 0 3px var(--signal-live-dim);
+}
+
+.status-dot[data-phase="Provisioning"],
+.status-dot[data-phase="Pending"] {
+    background: var(--signal-pending);
+    animation: pulse 1.4s ease-in-out infinite;
+}
+
+.status-dot[data-phase="Failed"] {
+    background: var(--signal-fault);
+}
+
+.status-dot[data-phase="Deleting"] {
+    background: var(--text-faint);
+    animation: pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes pulse {
+    0%,
+    100% {
+        box-shadow: 0 0 0 0 var(--signal-pending-dim);
+    }
+    50% {
+        box-shadow: 0 0 0 5px transparent;
+    }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .status-dot {
+        animation: none !important;
+    }
+}
+
+.status-label {
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+
+.slot-actions {
+    display: flex;
+    gap: 8px;
+    margin-top: 12px;
+}
+
+.slot-actions .btn {
+    padding: 7px 10px;
+    font-size: 11.5px;
+}
+
+.empty-state {
+    color: var(--text-muted);
+    font-size: 13px;
+    padding: 40px 0;
+    text-align: center;
+    font-family: var(--font-mono);
+}
